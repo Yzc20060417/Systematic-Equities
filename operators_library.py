@@ -41,6 +41,10 @@ def ts_zscore(df,window):
     s = df.rolling(window).std(ddof=1)
     return (df-m)/s
 
+# Rolling minimum
+def ts_min(df,window):
+    return df.rolling(window,min_periods=window).min()
+
 # Compute cross-section z-score
 def zscore(df):
     mean = df.mean(axis=1)
@@ -84,6 +88,12 @@ def densify(df):
 def ts_delay(df,d):
     return df.shift(d)
 
+# Assign group to dataframe
+def grouped_panel(df,group):
+    gm = group.reindex(df.columns)
+    arr = np.tile(gm.values,(len(df.index),1))
+    return pd.DataFrame(arr, index=df.index, columns=df.columns)
+
 # Subtract groupwise mean for each date
 def group_neutralize(df,group):
     out = df.copy()
@@ -96,6 +106,38 @@ def group_neutralize(df,group):
         if len(vals) == 0:
             continue
         out.loc[time,mask] = vals - vals.mean()
+    return out
+
+# Winsorize within each group per date using mean ± n_std * std
+def group_winsorize_std(df,group_panel,n_std):
+    df, group_panel = df.align(group_panel, join="inner", axis=0)
+    df, group_panel = df.align(group_panel, join="inner", axis=1)
+
+    out = df.astype(float).copy()
+
+    for t in out.index:
+        x = out.loc[t]
+        g = group_panel.loc[t]
+
+        for grp in pd.unique(g.dropna()):
+            mask = (g == grp)
+            vals = x[mask].to_numpy(dtype=float)
+            finite = np.isfinite(vals)
+            if finite.sum() < 3:
+                continue
+
+            v = vals[finite]
+            mu = v.mean()
+            sd = v.std(ddof=1)
+            if not np.isfinite(sd) or sd == 0:
+                continue
+
+            lo, hi = mu - n_std * sd, mu + n_std * sd
+            vals2 = vals.copy()
+            vals2[finite] = np.clip(vals[finite], lo, hi)
+
+            out.loc[t, mask] = vals2
+
     return out
 
 # Scale x for each date to sum of x == 1
