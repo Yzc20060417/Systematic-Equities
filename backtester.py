@@ -209,7 +209,7 @@ def cost_model_1(
     vol: pd.DataFrame,
     adv_dollar: pd.DataFrame,
     fee_bps: float = 4.0,
-    slippage_bps: float = 2.0.,
+    slippage_bps: float = 2.0,
     impact_eta: float = 0.10,
     impact_alpha: float = 0.50,
     aum: float = 1.0,
