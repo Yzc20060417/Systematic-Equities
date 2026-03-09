@@ -286,6 +286,144 @@ def implied_state_durations(T):
     out = pd.Series(1 / np.maximum(1 - pii, 1e-12), index=T.index, name="implied_duration")
     return out
 
+## 2.11 Build a clean panel with state labels and posterior probabilities.
+
+def make_regime_panel(X, hmm_out):
+    panel = X.copy()
+    panel["state"] = hmm_out["labels"]
+
+    probs = hmm_out["probs"].copy()
+    probs.columns = [f"p_state_{i}" for i in range(probs.shape[1])]
+    panel = panel.join(probs, how="left")
+
+    return panel
+
+## 2.12 Fit best HMM on one training sample.
+def fit_best_hmm_single_sample(X_train, k=3, covariance_type="diag",
+                               seeds=range(10), n_iter=1000, tol=1e-4):
+    Xv = X_train.values
+    best_model = None
+    best_loglik = -np.inf
+    best_seed = None
+
+    for seed in seeds:
+        try:
+            m = GaussianHMM(
+                n_components=k,
+                covariance_type=covariance_type,
+                n_iter=n_iter,
+                tol=tol,
+                random_state=seed
+            )
+            m.fit(Xv)
+            ll = m.score(Xv)
+
+            if np.isfinite(ll) and ll > best_loglik:
+                best_loglik = ll
+                best_model = m
+                best_seed = seed
+        except Exception:
+            continue
+
+    if best_model is None:
+        raise RuntimeError("No HMM fit succeeded on training sample.")
+    return best_model, best_seed, best_loglik
+
+## 2.13 Relabel states using macro order on the training sample.
+## Returns mapping and reordered probabilities for the training sample.
+def relabel_hmm_outputs(X_train, model):
+    raw_labels = model.predict(X_train.values)
+    relabeled, mapping, means_relabeled = relabel_states_by_macro_order(X_train, raw_labels)
+
+    probs = model.predict_proba(X_train.values)
+    inv_map = {new: old for old, new in mapping.items()}
+    probs = probs[:, [inv_map[i] for i in range(len(inv_map))]]
+
+    return relabeled, mapping, means_relabeled, probs
+
+## 2.14 Expanding-window filtered state inference.
+## For each date t >= min_train, fit on X[:t] and record P(state_t | X_1...X_t).
+def expanding_filtered_hmm(
+    X,
+    k=3,
+    min_train=156,          # 3 years of weekly data
+    refit_every=1,          # set to 4 for monthly-ish refits if speed is an issue
+    covariance_type="diag",
+    seeds=range(10),
+    n_iter=1000,
+    tol=1e-4,
+):
+    X = X.dropna().copy()
+    dates = X.index
+
+    prob_list = []
+    meta = []
+    fitted_models = {}
+
+    last_model = None
+    last_mapping = None
+    last_refit_idx = None
+
+    for t in range(min_train - 1, len(X)):
+        need_refit = (last_model is None) or ((t - (last_refit_idx or 0)) >= refit_every)
+
+        X_train = X.iloc[:t + 1]
+
+        if need_refit:
+            model, best_seed, best_loglik = fit_best_hmm_single_sample(
+                X_train=X_train,
+                k=k,
+                covariance_type=covariance_type,
+                seeds=seeds,
+                n_iter=n_iter,
+                tol=tol
+            )
+
+            _, mapping, means_relabeled, probs_train = relabel_hmm_outputs(X_train, model)
+
+            last_model = model
+            last_mapping = mapping
+            last_refit_idx = t
+
+            fitted_models[dates[t]] = {
+                "model": model,
+                "mapping": mapping,
+                "means": means_relabeled,
+                "best_seed": best_seed,
+                "loglik": best_loglik,
+            }
+
+        # use current model on training sample up to t
+        probs = last_model.predict_proba(X_train.values)
+        inv_map = {new: old for old, new in last_mapping.items()}
+        probs = probs[:, [inv_map[i] for i in range(len(inv_map))]]
+
+        p_t = probs[-1]
+        state_t = int(np.argmax(p_t))
+
+        row = pd.Series(
+            p_t,
+            index=[f"p_state_{i}" for i in range(k)],
+            name=dates[t]
+        )
+        row["state"] = state_t
+        prob_list.append(row)
+
+        meta.append({
+            "date": dates[t],
+            "refit_date": dates[last_refit_idx],
+            "refit_used": need_refit
+        })
+
+    probs_oos = pd.DataFrame(prob_list)
+    probs_oos.index = pd.to_datetime(probs_oos.index)
+    probs_oos["state"] = probs_oos["state"].astype(int)
+
+    meta_df = pd.DataFrame(meta).set_index("date")
+    meta_df.index = pd.to_datetime(meta_df.index)
+
+    return probs_oos, meta_df, fitted_models
+
 # 3. Regime Analyzers
 
 ## 3.1 Plot Regime timeline
@@ -373,3 +511,70 @@ def plot_transition_matrix(T, title="Transition Matrix"):
     plt.colorbar(im, ax=ax, shrink=0.85)
     plt.tight_layout()
     plt.show()
+
+## 3.5 Report of regimes
+def compact_regime_report(summary_df):
+    cols = [
+        "growth_mean", "rates_pressure_mean", "stress_mean",
+        "occupancy", "avg_duration", "median_duration", "n_runs"
+    ]
+    cols = [c for c in cols if c in summary_df.columns]
+    return summary_df[cols].copy()
+
+## 3.6 Plot OOS State Probabilities
+def plot_oos_state_probs(probs_oos, title="Pseudo-OOS Filtered State Probabilities"):
+    prob_cols = [c for c in probs_oos.columns if c.startswith("p_state_")]
+
+    fig, axes = plt.subplots(len(prob_cols), 1, figsize=(14, 2.2 * len(prob_cols)), sharex=True)
+    if len(prob_cols) == 1:
+        axes = [axes]
+
+    for ax, col in zip(axes, prob_cols):
+        ax.plot(probs_oos.index, probs_oos[col], lw=1.4)
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_title(col)
+
+    fig.suptitle(title, y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+## 3.7 Plot OOS State Timeline
+def plot_oos_state_timeline(X, probs_oos, title="Pseudo-OOS State Timeline"):
+    Xp = X.loc[probs_oos.index].copy()
+    labels = probs_oos["state"].values
+
+    plot_regime_timeline(Xp, labels, title=title)
+
+## 3.8 Summarize the state occupancy and duration in OOS
+def summarize_state_sequence(state_series):
+    runs = run_lengths(state_series.astype(int).values)
+
+    summary = pd.DataFrame({
+        "n_obs": state_series.value_counts().sort_index()
+    })
+    summary["occupancy"] = summary["n_obs"] / len(state_series)
+
+    duration_stats = runs.groupby("state")["duration"].agg(
+        avg_duration="mean",
+        median_duration="median",
+        max_duration="max",
+        n_runs="count"
+    )
+
+    summary = summary.join(duration_stats, how="left")
+    return summary.sort_index()
+
+## 3.9 Date Table of regime switches
+def regime_switch_table(state_series):
+    s = state_series.astype(int)
+    switch = s != s.shift(1)
+
+    out = pd.DataFrame({
+        "date": s.index,
+        "state": s.values,
+        "prev_state": s.shift(1).values,
+        "switch": switch.values
+    })
+
+    out = out.loc[out["switch"]].copy()
+    return out.reset_index(drop=True)
