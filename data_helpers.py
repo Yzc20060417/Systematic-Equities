@@ -18,6 +18,55 @@ def rolling_zscore(df, window = 104, min_periods = 52, clip: float | None = 4.0)
         z = z.clip(-clip, clip)
     return z
 
+etf_path_dir = Path.home() / 'Desktop' / 'Data' / 'ETF' / 'ETF'
+
+## 1.2 Read one ETF/stock csv and return a daily price series.
+def _load_price_series(file_path):
+    df = pd.read_csv(file_path)
+
+    date_col = 'DateTime'
+    price_col = 'Close'
+
+    s = (
+        df[[date_col, price_col]]
+        .rename(columns={date_col: "date", price_col: "price"})
+        .dropna(subset=["date", "price"])
+        .copy()
+    )
+
+    s["date"] = pd.to_datetime(s["date"])
+    s["price"] = pd.to_numeric(s["price"], errors="coerce")
+    s = s.dropna(subset=["price"]).sort_values("date")
+    s = s.drop_duplicates(subset=["date"], keep="last")
+    s = s.set_index("date")["price"]
+
+    s.name = file_path.stem.upper()
+    return s
+
+## 1.3 Load daily price panel from folder of csv files.
+def load_prices(folder, tickers_set):
+    series_list = []
+
+    for file_path in sorted(folder.glob("*.csv")):
+        ticker = file_path.stem.upper()
+        if tickers_set is not None and ticker not in tickers_set:
+            continue
+        s = _load_price_series(file_path)
+        series_list.append(s)
+
+    prices_daily = pd.concat(series_list, axis=1).sort_index()
+    return prices_daily
+
+## 1.4 Convert daily price panel to weekly prices. If research_index is provided, final outputs are aligned exactly to it.
+def daily_to_weekly(prices_daily, research_index=None, freq="W-FRI"):
+    prices_daily = prices_daily.sort_index()
+    weekly_prices = prices_daily.resample(freq).last().ffill()
+
+    if research_index is not None:
+        research_index = pd.DatetimeIndex(research_index).sort_values()
+        weekly_prices = weekly_prices.reindex(research_index).ffill()
+    return weekly_prices
+
 # 2. HMM Oriented
 
 ## 2.1 Return time span for certain regime
@@ -341,7 +390,15 @@ def relabel_hmm_outputs(X_train, model):
 
     return relabeled, mapping, means_relabeled, probs
 
-## 2.14 Expanding-window filtered state inference.
+## 2.14 Probability smoothing before hard assignment
+def smooth_state_probs(probs_oos, window=3):
+    prob_cols = [c for c in probs_oos.columns if c.startswith("p_state_")]
+    out = probs_oos.copy()
+    out[prob_cols] = out[prob_cols].rolling(window=window, min_periods=1).mean()
+    out["state"] = out[prob_cols].values.argmax(axis=1)
+    return out
+
+## 2.15 Expanding-window filtered state inference.
 ## For each date t >= min_train, fit on X[:t] and record P(state_t | X_1...X_t).
 def expanding_filtered_hmm(
     X,
@@ -578,3 +635,32 @@ def regime_switch_table(state_series):
 
     out = out.loc[out["switch"]].copy()
     return out.reset_index(drop=True)
+
+# 4. Asset Behavior Analyzers
+
+## 4.1 Compute forward return stats by state for a single asset return series. Horizons are in weeks
+def state_forward_return_stats(state_series, ret_series, horizons=(1, 4, 12), name="asset"):
+    df = pd.DataFrame({
+        "state": state_series,
+        "ret": ret_series
+    }).dropna()
+
+    out = {}
+
+    for h in horizons:
+        fwd = (1 + df["ret"]).rolling(h).apply(np.prod, raw=True).shift(-h + 1) - 1
+        tmp = pd.DataFrame({
+            "state": df["state"],
+            f"fwd_{h}w": fwd
+        }).dropna()
+
+        stats = tmp.groupby("state")[f"fwd_{h}w"].agg(
+            mean="mean",
+            median="median",
+            std="std",
+            hit_rate=lambda x: (x > 0).mean(),
+            n_obs="count"
+        )
+        out[h] = stats
+
+    return out
