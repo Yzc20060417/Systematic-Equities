@@ -261,3 +261,72 @@ def fit_hmm_grid(X, ks=(2, 3, 4), covariance_type="diag", seeds=range(20), n_ite
         models[k] = out
     results_df = pd.DataFrame(results).sort_values("k").reset_index(drop=True)
     return results_df, models
+
+# 3. Regime Analyzers
+
+## 3.1 Plot Regime timeline
+def plot_regime_timeline(X, labels, title="Regime Timeline"):
+    colors = plt.cm.Set2.colors
+    spans = contiguous_state_spans(X.index, labels)
+
+    fig, axes = plt.subplots(
+        X.shape[1], 1,
+        figsize=(14, 2.8 * X.shape[1]),
+        sharex=True
+    )
+
+    if X.shape[1] == 1:
+        axes = [axes]
+
+    for ax, col in zip(axes, X.columns):
+        for sp in spans:
+            ax.axvspan(
+                sp["start"], sp["end"],
+                color=colors[sp["state"] % len(colors)],
+                alpha=0.18
+            )
+        ax.plot(X.index, X[col], lw=1.5)
+        ax.set_title(col)
+
+    fig.suptitle(title, y=1.02, fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+## 3.2 Plot the means of labels within the regimes
+def plot_state_means(summary_df, title="State Conditional Means"):
+    mean_cols = [c for c in summary_df.columns if c.endswith("_mean")]
+    M = summary_df[mean_cols].copy()
+    M.columns = [c.replace("_mean", "") for c in M.columns]
+
+    fig, ax = plt.subplots(figsize=(8, 1.6 * len(M)))
+    im = ax.imshow(M.values, aspect="auto", cmap="coolwarm")
+
+    ax.set_xticks(range(len(M.columns)))
+    ax.set_xticklabels(M.columns, rotation=45, ha="right")
+    ax.set_yticks(range(len(M.index)))
+    ax.set_yticklabels([f"state_{i}" for i in M.index])
+
+    for i in range(M.shape[0]):
+        for j in range(M.shape[1]):
+            ax.text(j, i, f"{M.iloc[i, j]:.2f}", ha="center", va="center", fontsize=9)
+
+    ax.set_title(title)
+    plt.colorbar(im, ax=ax, shrink=0.85)
+    plt.tight_layout()
+    plt.show()
+
+## 3.3 Plot the posterior probabilities for the hmm
+def plot_hmm_posteriors(probs, title="HMM Posterior Probabilities"):
+    fig, axes = plt.subplots(probs.shape[1], 1, figsize=(14, 2.2 * probs.shape[1]), sharex=True)
+
+    if probs.shape[1] == 1:
+        axes = [axes]
+
+    for i, col in enumerate(probs.columns):
+        axes[i].plot(probs.index, probs[col], lw=1.4)
+        axes[i].set_ylim(-0.02, 1.02)
+        axes[i].set_title(col)
+
+    fig.suptitle(title, y=1.02, fontsize=14)
+    plt.tight_layout()
+    plt.show()
