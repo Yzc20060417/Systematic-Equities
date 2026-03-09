@@ -636,6 +636,12 @@ def regime_switch_table(state_series):
     out = out.loc[out["switch"]].copy()
     return out.reset_index(drop=True)
 
+## 3.10 Inspect means of features in regimes
+def oos_state_feature_means(X_features, state_series):
+    df = X_features.loc[state_series.index].copy()
+    df["state"] = state_series
+    return df.groupby("state").mean()
+
 # 4. Asset Behavior Analyzers
 
 ## 4.1 Compute forward return stats by state for a single asset return series. Horizons are in weeks
