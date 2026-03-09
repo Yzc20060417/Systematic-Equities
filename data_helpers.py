@@ -664,3 +664,122 @@ def state_forward_return_stats(state_series, ret_series, horizons=(1, 4, 12), na
         out[h] = stats
 
     return out
+
+## 4.2 Forward compounded return over `horizon` weeks.
+def make_forward_return(ret_series, horizon):
+    return (1.0 + ret_series).rolling(horizon).apply(np.prod, raw=True).shift(-horizon + 1) - 1.0
+
+## 4.3 Compute forward return statistics by hard regime state for each asset.
+def regime_forward_return_stats(
+    state_series,
+    asset_returns,
+    horizons=(1, 4, 12),
+):
+    state_series = state_series.copy()
+    asset_returns = asset_returns.copy()
+
+    idx = state_series.index.intersection(asset_returns.index)
+    state_series = state_series.loc[idx]
+    asset_returns = asset_returns.loc[idx]
+
+    results = {}
+
+    for asset in asset_returns.columns:
+        asset_res = {}
+        for h in horizons:
+            fwd = make_forward_return(asset_returns[asset], h)
+            tmp = pd.DataFrame({
+                "state": state_series,
+                "fwd_ret": fwd
+            }).dropna()
+            stats = tmp.groupby("state")["fwd_ret"].agg(
+                mean="mean",
+                median="median",
+                std="std",
+                hit_rate=lambda x: (x > 0).mean(),
+                q25=lambda x: x.quantile(0.25),
+                q75=lambda x: x.quantile(0.75),
+                n_obs="count"
+            )
+            asset_res[h] = stats
+        results[asset] = asset_res
+    return results
+
+## 4.4 Probability-weighted forward returns for each state and asset.
+## probs_df should contain columns like p_state_0, p_state_1, ...
+def probability_weighted_forward_returns(
+    probs_df,
+    asset_returns,
+    horizons=(1, 4, 12),
+):
+    prob_cols = [c for c in probs_df.columns if c.startswith("p_state_")]
+    idx = probs_df.index.intersection(asset_returns.index)
+    probs_df = probs_df.loc[idx]
+    asset_returns = asset_returns.loc[idx]
+
+    results = {}
+
+    for asset in asset_returns.columns:
+        asset_res = {}
+        for h in horizons:
+            fwd = make_forward_return(asset_returns[asset], h)
+            tmp = probs_df.copy()
+            tmp["fwd_ret"] = fwd
+            tmp = tmp.dropna()
+            rows = {}
+            for pcol in prob_cols:
+                w = tmp[pcol]
+                x = tmp["fwd_ret"]
+                wsum = w.sum()
+                mean = np.nan if wsum == 0 else (w * x).sum() / wsum
+
+                rows[pcol] = {
+                    "prob_weighted_mean": mean,
+                    "avg_probability": w.mean(),
+                    "n_obs": len(tmp),
+                }
+            asset_res[h] = pd.DataFrame(rows).T
+        results[asset] = asset_res
+    return results
+
+## 4.5 Build a table: rows = assets, cols = states, values = mean forward returns
+def regime_mean_table(results, horizon):
+    rows = []
+    for asset, asset_res in results.items():
+        df = asset_res[horizon]["mean"].rename(asset)
+        rows.append(df)
+
+    out = pd.DataFrame(rows)
+    out.index.name = "asset"
+    return out
+
+## 4.6 Build a table: rows = assets, cols = states, values = hit rates
+def regime_hit_rate_table(results, horizon):
+    rows = []
+    for asset, asset_res in results.items():
+        df = asset_res[horizon]["hit_rate"].rename(asset)
+        rows.append(df)
+
+    out = pd.DataFrame(rows)
+    out.index.name = "asset"
+    return out
+
+## 4.7 Plot mean table as a matrix
+def plot_mean_table(mean_table, title="Mean Forward Returns by State"):
+    fig, ax = plt.subplots(figsize=(8, max(4, 0.5 * len(mean_table))))
+    im = ax.imshow(mean_table.values, aspect="auto", cmap="coolwarm")
+
+    ax.set_xticks(range(mean_table.shape[1]))
+    ax.set_xticklabels(mean_table.columns)
+    ax.set_yticks(range(mean_table.shape[0]))
+    ax.set_yticklabels(mean_table.index)
+
+    for i in range(mean_table.shape[0]):
+        for j in range(mean_table.shape[1]):
+            val = mean_table.iloc[i, j]
+            ax.text(j, i, f"{val:.3f}", ha="center", va="center", fontsize=9)
+
+    ax.set_title(title)
+    plt.colorbar(im, ax=ax, shrink=0.85)
+    plt.tight_layout()
+    plt.show()
