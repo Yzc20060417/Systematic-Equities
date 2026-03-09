@@ -51,7 +51,7 @@ def run_lengths(labels):
 ## Ordering score: macro_score = stress - growth + 0.25 * rates_pressure
 ## Lower score  -> easier / lower-stress regime
 ## Higher score -> more stressed / weaker-growth regime
-def relabel_states_by_macro_order(X, labels):
+def relabel_states_by_macro_order(X, labels, pressure_coeff = 0.25):
     X = X.copy()
     labels = pd.Series(labels, index=X.index, name="state")
 
@@ -60,7 +60,7 @@ def relabel_states_by_macro_order(X, labels):
     macro_score = (
         means["stress"]
         - means["growth"]
-        + 0.25 * means["rates_pressure"]
+        + pressure_coeff * means["rates_pressure"]
     )
 
     old_order = macro_score.sort_values().index.tolist()
