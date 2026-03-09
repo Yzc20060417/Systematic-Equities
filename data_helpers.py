@@ -262,6 +262,30 @@ def fit_hmm_grid(X, ks=(2, 3, 4), covariance_type="diag", seeds=range(20), n_ite
     results_df = pd.DataFrame(results).sort_values("k").reset_index(drop=True)
     return results_df, models
 
+
+## 2.9 Reorder raw HMM transition matrix into the relabeled macro order. hmm_out is one entry from hmm_models[k]
+def reorder_transition_matrix(hmm_out):
+    T_raw = hmm_out["model"].transmat_.copy()
+    mapping = hmm_out["mapping"] if "mapping" in hmm_out else None
+    if mapping is None:
+        # fallback: assume already ordered
+        T = T_raw
+        order = list(range(T.shape[0]))
+    else:
+        # mapping: old_label -> new_label
+        inv_map = {new: old for old, new in mapping.items()}
+        order = [inv_map[i] for i in range(len(inv_map))]
+        T = T_raw[np.ix_(order, order)]
+    idx = [f"state_{i}" for i in range(T.shape[0])]
+    T = pd.DataFrame(T, index=idx, columns=idx)
+    return T, order
+
+## 2.10 For a Markov chain, implied expected duration in state i is 1 / (1 - p_ii).
+def implied_state_durations(T):
+    pii = np.diag(T.values)
+    out = pd.Series(1 / np.maximum(1 - pii, 1e-12), index=T.index, name="implied_duration")
+    return out
+
 # 3. Regime Analyzers
 
 ## 3.1 Plot Regime timeline
@@ -328,5 +352,24 @@ def plot_hmm_posteriors(probs, title="HMM Posterior Probabilities"):
         axes[i].set_title(col)
 
     fig.suptitle(title, y=1.02, fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+## 3.4 Plot the transition matrix
+def plot_transition_matrix(T, title="Transition Matrix"):
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(T.values, cmap="Blues", vmin=0, vmax=1)
+
+    ax.set_xticks(range(T.shape[1]))
+    ax.set_xticklabels(T.columns)
+    ax.set_yticks(range(T.shape[0]))
+    ax.set_yticklabels(T.index)
+
+    for i in range(T.shape[0]):
+        for j in range(T.shape[1]):
+            ax.text(j, i, f"{T.iloc[i, j]:.2f}", ha="center", va="center", fontsize=10)
+
+    ax.set_title(title)
+    plt.colorbar(im, ax=ax, shrink=0.85)
     plt.tight_layout()
     plt.show()
