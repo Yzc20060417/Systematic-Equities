@@ -67,6 +67,39 @@ def daily_to_weekly(prices_daily, research_index=None, freq="W-FRI"):
         weekly_prices = weekly_prices.reindex(research_index).ffill()
     return weekly_prices
 
+## 1.5 Convert a daily/irregular level dataframe to weekly Friday level dataframe.
+def _to_weekly_level_panel(df, research_index=None, freq="W-FRI", ffill=True):
+    out = df.copy()
+    out.index = pd.to_datetime(out.index)
+    out = out.sort_index()
+
+    for c in out.columns:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    out = out.resample(freq).last()
+
+    if ffill:
+        out = out.ffill()
+    if research_index is not None:
+        idx = pd.DatetimeIndex(research_index).sort_values()
+        out = out.reindex(idx)
+        if ffill:
+            out = out.ffill()
+    return out
+
+## 1.6 Trim the raw panel to the first date where all required columns are available.
+def trim_to_common_sample(df, required_cols=None):
+    out = df.copy()
+    cols = list(out.columns) if required_cols is None else list(required_cols)
+    tmp = out[cols].dropna(how="any")
+    if tmp.empty:
+        raise ValueError("No common sample exists across the required columns.")
+
+    start = tmp.index.min()
+    out_common = out.loc[start:].copy()
+    out_common = out.dropna(subset=cols, how="any").copy()
+    return out_common, start
+
 # 2. HMM Oriented
 
 ## 2.1 Return time span for certain regime
