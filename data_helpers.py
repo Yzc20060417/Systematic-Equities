@@ -1173,3 +1173,23 @@ def pivot_metric(df, metric):
     out.index.name = "asset"
     out.columns.name = "state"
     return out
+
+## 4.17 Plot Heatmap from metric table
+def plot_metric_table(table, title):
+    fig, ax = plt.subplots(figsize=(8, max(4, 0.5 * len(table))))
+    im = ax.imshow(table.values, aspect="auto", cmap="coolwarm")
+
+    ax.set_xticks(range(table.shape[1]))
+    ax.set_xticklabels(table.columns)
+    ax.set_yticks(range(table.shape[0]))
+    ax.set_yticklabels(table.index)
+
+    for i in range(table.shape[0]):
+        for j in range(table.shape[1]):
+            val = table.iloc[i, j]
+            ax.text(j, i, f"{val:.3f}", ha="center", va="center", fontsize=9)
+
+    ax.set_title(title)
+    plt.colorbar(im, ax=ax, shrink=0.85)
+    plt.tight_layout()
+    plt.show()
