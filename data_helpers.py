@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score
 from hmmlearn.hmm import GaussianHMM
+import statsmodels.api as sm
 
 # 1. Basic Helpers
 
@@ -514,6 +515,78 @@ def expanding_filtered_hmm(
 
     return probs_oos, meta_df, fitted_models
 
+## 2.16 - full-sample HMM
+## - pseudo-OOS expanding-window HMM
+## - smoothed pseudo-OOS probabilities
+## - OOS state feature means
+def run_regime_workflow(
+    X_model,
+    k,
+    refit_every=4,
+    smooth_window=3,
+    min_train=104,
+    covariance_type="diag",
+    seeds=range(20),
+    n_iter=1500,
+    tol=1e-4,
+):
+    X_model = X_model.dropna().copy()
+
+    # Full-sample HMM
+    hmm_results_df, hmm_models_dict = fit_hmm_grid(
+        X_model,
+        ks=(k,),
+        covariance_type=covariance_type,
+        seeds=seeds,
+        n_iter=n_iter,
+        tol=tol,
+    )
+    hmm_k = hmm_models_dict[k]
+
+    # Transition matrix
+    if "mapping" not in hmm_k:
+        raw_labels = hmm_k["model"].predict(X_model.values)
+        relabeled, mapping, means = relabel_states_by_macro_order(X_model, raw_labels)
+        hmm_k["mapping"] = mapping
+        hmm_k["means"] = means
+
+    T_k, _ = reorder_transition_matrix(hmm_k)
+    dur_k = implied_state_durations(T_k)
+
+    # Pseudo-OOS
+    probs_oos, meta_oos, fitted_oos = expanding_filtered_hmm(
+        X=X_model,
+        k=k,
+        min_train=min_train,
+        refit_every=refit_every,
+        covariance_type=covariance_type,
+        seeds=seeds,
+        n_iter=n_iter,
+        tol=tol,
+    )
+
+    probs_oos_s = smooth_state_probs(probs_oos, window=smooth_window)
+
+    # OOS state feature means
+    oos_means = oos_state_feature_means(X_model, probs_oos_s["state"])
+
+    # OOS state duration summary
+    oos_summary = summarize_state_sequence(probs_oos_s["state"])
+
+    return {
+        "X_model": X_model,
+        "full_hmm_results": hmm_results_df,
+        "full_hmm": hmm_k,
+        "transition_matrix": T_k,
+        "implied_duration": dur_k,
+        "probs_oos_raw": probs_oos,
+        "probs_oos_s": probs_oos_s,
+        "meta_oos": meta_oos,
+        "fitted_oos": fitted_oos,
+        "oos_means": oos_means,
+        "oos_summary": oos_summary,
+    }
+
 # 3. Regime Analyzers
 
 ## 3.1 Plot Regime timeline
@@ -708,7 +781,21 @@ def state_forward_return_stats(state_series, ret_series, horizons=(1, 4, 12), na
 def make_forward_return(ret_series, horizon):
     return (1.0 + ret_series).rolling(horizon).apply(np.prod, raw=True).shift(-horizon + 1) - 1.0
 
-## 4.3 Compute forward return statistics by hard regime state for each asset.
+## 4.3 Compute Max drawdown for forward returns
+def max_drawdown_from_returns(ret_series):
+    eq = (1.0 + ret_series.fillna(0.0)).cumprod()
+    peak = eq.cummax()
+    dd = eq / peak - 1.0
+    return dd.min()
+
+## 4.4 Align states and returns date lable
+def align_state_and_returns(state_series, ret_df):
+    idx = pd.DatetimeIndex(state_series.index).intersection(pd.DatetimeIndex(ret_df.index))
+    state_series = state_series.loc[idx].astype(int)
+    ret_df = ret_df.loc[idx].copy()
+    return state_series, ret_df
+
+## 4.5 Compute forward return statistics by hard regime state for each asset.
 def regime_forward_return_stats(
     state_series,
     asset_returns,
@@ -744,7 +831,7 @@ def regime_forward_return_stats(
         results[asset] = asset_res
     return results
 
-## 4.4 Probability-weighted forward returns for each state and asset.
+## 4.6 Probability-weighted forward returns for each state and asset.
 ## probs_df should contain columns like p_state_0, p_state_1, ...
 def probability_weighted_forward_returns(
     probs_df,
@@ -781,7 +868,7 @@ def probability_weighted_forward_returns(
         results[asset] = asset_res
     return results
 
-## 4.5 Build a table: rows = assets, cols = states, values = mean forward returns
+## 4.7 Build a table: rows = assets, cols = states, values = mean forward returns
 def regime_mean_table(results, horizon):
     rows = []
     for asset, asset_res in results.items():
@@ -792,7 +879,7 @@ def regime_mean_table(results, horizon):
     out.index.name = "asset"
     return out
 
-## 4.6 Build a table: rows = assets, cols = states, values = hit rates
+## 4.8 Build a table: rows = assets, cols = states, values = hit rates
 def regime_hit_rate_table(results, horizon):
     rows = []
     for asset, asset_res in results.items():
@@ -803,7 +890,7 @@ def regime_hit_rate_table(results, horizon):
     out.index.name = "asset"
     return out
 
-## 4.7 Plot mean table as a matrix
+## 4.9 Plot mean table as a matrix
 def plot_mean_table(mean_table, title="Mean Forward Returns by State"):
     fig, ax = plt.subplots(figsize=(8, max(4, 0.5 * len(mean_table))))
     im = ax.imshow(mean_table.values, aspect="auto", cmap="coolwarm")
@@ -822,3 +909,267 @@ def plot_mean_table(mean_table, title="Mean Forward Returns by State"):
     plt.colorbar(im, ax=ax, shrink=0.85)
     plt.tight_layout()
     plt.show()
+
+## 4.10 Test whether mean forward return in a given state is different from 0, using HAC/Newey-West standard errors.
+def hac_mean_test_by_state(state_series, ret_series, state, horizon=4, nw_lags=None):
+    if nw_lags is None:
+        nw_lags = max(horizon - 1, 1)
+    fwd = make_forward_return(ret_series, horizon)
+    df = pd.DataFrame({"state": state_series, "fwd": fwd}).dropna()
+    df = df.loc[df["state"] == state].copy()
+
+    if len(df) < 10:
+        return pd.Series({
+            "state": state,
+            "n_obs": len(df),
+            "mean": np.nan,
+            "se_hac": np.nan,
+            "t_hac": np.nan,
+            "pvalue_hac": np.nan,
+        })
+
+    X = np.ones((len(df), 1))
+    model = sm.OLS(df["fwd"].values, X).fit(cov_type="HAC", cov_kwds={"maxlags": nw_lags})
+
+    return pd.Series({
+        "state": state,
+        "n_obs": len(df),
+        "mean": model.params[0],
+        "se_hac": model.bse[0],
+        "t_hac": model.tvalues[0],
+        "pvalue_hac": model.pvalues[0],
+    })
+
+## 4.11 Test whether mean forward return differs between state_a and state_b, using HAC/Newey-West SE.
+def hac_diff_test_between_states(state_series, ret_series, state_a, state_b, horizon=4, nw_lags=None):
+    if nw_lags is None:
+        nw_lags = max(horizon - 1, 1)
+
+    fwd = make_forward_return(ret_series, horizon)
+    df = pd.DataFrame({"state": state_series, "fwd": fwd}).dropna()
+    df = df.loc[df["state"].isin([state_a, state_b])].copy()
+
+    if len(df) < 20:
+        return pd.Series({
+            "state_a": state_a,
+            "state_b": state_b,
+            "n_obs": len(df),
+            "mean_a": np.nan,
+            "mean_b": np.nan,
+            "diff_b_minus_a": np.nan,
+            "se_hac": np.nan,
+            "t_hac": np.nan,
+            "pvalue_hac": np.nan,
+        })
+
+    df["is_b"] = (df["state"] == state_b).astype(int)
+
+    X = sm.add_constant(df["is_b"])
+    model = sm.OLS(df["fwd"].values, X).fit(cov_type="HAC", cov_kwds={"maxlags": nw_lags})
+
+    alpha = model.params["const"]
+    beta = model.params["is_b"]
+
+    return pd.Series({
+        "state_a": state_a,
+        "state_b": state_b,
+        "n_obs": len(df),
+        "mean_a": alpha,
+        "mean_b": alpha + beta,
+        "diff_b_minus_a": beta,
+        "se_hac": model.bse["is_b"],
+        "t_hac": model.tvalues["is_b"],
+        "pvalue_hac": model.pvalues["is_b"],
+    })
+
+## 4.12 Moving-block bootstrap for difference in mean forward returns: mean(state_b) - mean(state_a)
+## Uses overlapping forward returns, so block bootstrap is more appropriate than iid bootstrap.
+def moving_block_bootstrap_diff(state_series, ret_series, state_a, state_b, horizon=4,
+                                block_size=None, n_boot=2000, random_state=42):
+    rng = np.random.default_rng(random_state)
+
+    if block_size is None:
+        block_size = max(2 * horizon, 8)
+    fwd = make_forward_return(ret_series, horizon)
+    df = pd.DataFrame({"state": state_series, "fwd": fwd}).dropna().copy()
+    n = len(df)
+    if n < block_size + 5:
+        return pd.Series({
+            "state_a": state_a,
+            "state_b": state_b,
+            "obs_diff": np.nan,
+            "boot_mean": np.nan,
+            "boot_std": np.nan,
+            "ci_5": np.nan,
+            "ci_50": np.nan,
+            "ci_95": np.nan,
+        })
+
+    obs_a = df.loc[df["state"] == state_a, "fwd"].mean()
+    obs_b = df.loc[df["state"] == state_b, "fwd"].mean()
+    obs_diff = obs_b - obs_a
+
+    diffs = []
+    max_start = n - block_size
+
+    for _ in range(n_boot):
+        pieces = []
+        total = 0
+
+        while total < n:
+            start = rng.integers(0, max_start + 1)
+            block = df.iloc[start:start + block_size]
+            pieces.append(block)
+            total += len(block)
+
+        boot = pd.concat(pieces, axis=0).iloc[:n].copy()
+
+        a_mean = boot.loc[boot["state"] == state_a, "fwd"].mean()
+        b_mean = boot.loc[boot["state"] == state_b, "fwd"].mean()
+        diffs.append(b_mean - a_mean)
+
+    diffs = np.asarray(diffs)
+
+    return pd.Series({
+        "state_a": state_a,
+        "state_b": state_b,
+        "obs_diff": obs_diff,
+        "boot_mean": np.nanmean(diffs),
+        "boot_std": np.nanstd(diffs, ddof=1),
+        "ci_5": np.nanquantile(diffs, 0.05),
+        "ci_50": np.nanquantile(diffs, 0.50),
+        "ci_95": np.nanquantile(diffs, 0.95),
+    })
+
+## 4.13 Run HAC mean tests, HAC pairwise diff tests, and block bootstrap diff tests for all spread columns and horizons.
+def run_caution_checks_all_spreads(state_series, spread_ret_df, horizons=(1, 4, 12), state_pairs=None):
+    state_series, spread_ret_df = align_state_and_returns(state_series, spread_ret_df)
+    if state_pairs is None:
+        states = sorted(state_series.dropna().unique().tolist())
+        state_pairs = []
+        for i in range(len(states)):
+            for j in range(i + 1, len(states)):
+                state_pairs.append((states[i], states[j]))
+    mean_tests = []
+    diff_tests = []
+    boot_tests = []
+    for asset in spread_ret_df.columns:
+        r = spread_ret_df[asset]
+
+        for h in horizons:
+            for s in sorted(state_series.unique()):
+                row = hac_mean_test_by_state(state_series, r, state=s, horizon=h)
+                row["asset"] = asset
+                row["horizon"] = h
+                mean_tests.append(row)
+
+            for a, b in state_pairs:
+                row = hac_diff_test_between_states(state_series, r, state_a=a, state_b=b, horizon=h)
+                row["asset"] = asset
+                row["horizon"] = h
+                diff_tests.append(row)
+
+                brow = moving_block_bootstrap_diff(state_series, r, state_a=a, state_b=b, horizon=h)
+                brow["asset"] = asset
+                brow["horizon"] = h
+                boot_tests.append(brow)
+    mean_tests = pd.DataFrame(mean_tests)
+    diff_tests = pd.DataFrame(diff_tests)
+    boot_tests = pd.DataFrame(boot_tests)
+
+    return mean_tests, diff_tests, boot_tests
+
+## 4.14 Weekly return stats on the subset of weeks belonging to each state.
+def state_conditional_risk_stats(state_series, ret_df, ann_factor=52):
+    state_series, ret_df = align_state_and_returns(state_series, ret_df)
+    rows = []
+    states = sorted(state_series.dropna().unique().tolist())
+
+    for asset in ret_df.columns:
+        for s in states:
+            x = ret_df.loc[state_series == s, asset].dropna()
+
+            if len(x) == 0:
+                continue
+
+            mean_w = x.mean()
+            vol_w = x.std(ddof=1)
+            downside = x[x < 0].std(ddof=1)
+            hit = (x > 0).mean()
+            mdd = max_drawdown_from_returns(x)
+
+            ann_mean = mean_w * ann_factor
+            ann_vol = vol_w * np.sqrt(ann_factor)
+            ann_down = downside * np.sqrt(ann_factor) if pd.notna(downside) else np.nan
+
+            sharpe = np.nan if (ann_vol == 0 or pd.isna(ann_vol)) else ann_mean / ann_vol
+            sortino = np.nan if (ann_down == 0 or pd.isna(ann_down)) else ann_mean / ann_down
+
+            rows.append({
+                "asset": asset,
+                "state": s,
+                "n_obs": len(x),
+                "mean_w": mean_w,
+                "vol_w": vol_w,
+                "hit_rate": hit,
+                "ann_mean": ann_mean,
+                "ann_vol": ann_vol,
+                "sharpe": sharpe,
+                "sortino": sortino,
+                "max_drawdown": mdd,
+            })
+
+    return pd.DataFrame(rows).sort_values(["asset", "state"]).reset_index(drop=True)
+
+## 4.15 For each state s and asset: strategy return at t = asset return at t if state_{t-lag} == s else 0
+## lag=1 is the safer default for implementability.
+def timed_state_strategy_stats(state_series, ret_df, lag=1, ann_factor=52):
+    state_series, ret_df = align_state_and_returns(state_series, ret_df)
+    state_lag = state_series.shift(lag)
+
+    rows = []
+    states = sorted(state_series.dropna().unique().tolist())
+
+    for asset in ret_df.columns:
+        r = ret_df[asset].fillna(0.0)
+
+        for s in states:
+            signal = (state_lag == s).astype(float)
+            strat = signal * r
+
+            mean_w = strat.mean()
+            vol_w = strat.std(ddof=1)
+            downside = strat[strat < 0].std(ddof=1)
+            hit = (strat > 0).mean()
+            exposure = signal.mean()
+            mdd = max_drawdown_from_returns(strat)
+
+            ann_mean = mean_w * ann_factor
+            ann_vol = vol_w * np.sqrt(ann_factor)
+            ann_down = downside * np.sqrt(ann_factor) if pd.notna(downside) else np.nan
+
+            sharpe = np.nan if (ann_vol == 0 or pd.isna(ann_vol)) else ann_mean / ann_vol
+            sortino = np.nan if (ann_down == 0 or pd.isna(ann_down)) else ann_mean / ann_down
+
+            rows.append({
+                "asset": asset,
+                "state": s,
+                "exposure": exposure,
+                "mean_w": mean_w,
+                "vol_w": vol_w,
+                "hit_rate": hit,
+                "ann_mean": ann_mean,
+                "ann_vol": ann_vol,
+                "sharpe": sharpe,
+                "sortino": sortino,
+                "max_drawdown": mdd,
+            })
+
+    return pd.DataFrame(rows).sort_values(["asset", "state"]).reset_index(drop=True)
+
+## 4.16 Compact pivot tables for risk metrics
+def pivot_metric(df, metric):
+    out = df.pivot(index="asset", columns="state", values=metric)
+    out.index.name = "asset"
+    out.columns.name = "state"
+    return out
