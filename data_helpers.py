@@ -69,7 +69,7 @@ def daily_to_weekly(prices_daily, research_index=None, freq="W-FRI"):
     return weekly_prices
 
 ## 1.5 Convert a daily/irregular level dataframe to weekly Friday level dataframe.
-def _to_weekly_level_panel(df, research_index=None, freq="W-FRI", ffill=True):
+def to_weekly_level_panel(df, research_index=None, freq="W-FRI", ffill=True):
     out = df.copy()
     out.index = pd.to_datetime(out.index)
     out = out.sort_index()
