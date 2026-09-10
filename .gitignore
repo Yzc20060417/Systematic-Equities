@@ -9,3 +9,6 @@
 # Python
 __pycache__/
 *.py[cod]
+
+# Data
+data/processed/macro_regime_v2/
